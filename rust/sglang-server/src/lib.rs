@@ -93,7 +93,6 @@ impl Server {
         let api_worker_num = server_args.api_worker_num();
 
         let tokenizer_path = server_args.tokenizer_path();
-        let revision = server_args.revision();
 
         let server_args = std::sync::Arc::new(server_args);
 
@@ -107,7 +106,6 @@ impl Server {
             channel_cap,
             cores,
             tokenizer_path,
-            revision,
             server_args,
         };
         let rt = runtime::start(cfg).map_err(|e| {

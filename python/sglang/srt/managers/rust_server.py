@@ -27,6 +27,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
 
 if TYPE_CHECKING:
     from sglang_server import Server
@@ -303,6 +304,17 @@ class RustServer:
         model_config = dict(vars(scheduler.model_config))
         model_config["hf_config"] = None  # HF config is not JSON-serializable
         server_args["model_config"] = model_config
+
+        # The Rust server only reads local files (hub-blind, so it can never
+        # disagree with huggingface_hub about cache layout): resolve a repo-id
+        # tokenizer_path to the cached tokenizer.json here. No network — the
+        # scheduler's init_tokenizer already downloaded it.
+        if not scheduler.server_args.skip_tokenizer_init:
+            path = server_args["tokenizer_path"] or server_args["model_path"]
+            if not os.path.exists(path):
+                server_args["tokenizer_path"] = _resolve_local_or_cached_file(
+                    path, "tokenizer.json", server_args["revision"]
+                )
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 

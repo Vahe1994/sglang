@@ -42,12 +42,10 @@ pub struct RuntimeConfig {
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
     pub cores: Option<Vec<usize>>,
-    /// Path to a `tokenizer.json` (or a model dir containing one, a tiktoken
-    /// model file, or an HF Hub repo id resolved via the local cache). `None`
+    /// Path to a `tokenizer.json` (or a local model dir containing one; repo
+    /// ids are resolved by the Python launcher before startup). `None`
     /// requires `skip_tokenizer_init`; otherwise startup is a hard error.
     pub tokenizer_path: Option<String>,
-    /// HF revision used only when `tokenizer_path` is a repo id. `None` → main.
-    pub revision: Option<String>,
     /// Static server metadata (server_args + model_config) for config endpoints.
     /// `Arc` so cloning the config (and, downstream, each `AppState`) is cheap;
     /// `ServerArgs` itself is immutable after construction.
@@ -66,7 +64,6 @@ impl Default for RuntimeConfig {
             channel_cap: 8192,
             cores: None,
             tokenizer_path: None,
-            revision: None,
             server_args: Arc::new(ServerArgs::default()),
         }
     }
@@ -155,19 +152,12 @@ impl ServerArgs {
     }
 
     /// Tokenizer source: explicit `tokenizer_path`, falling back to `model_path`
-    /// (a model dir / HF repo id the Rust backend resolves). `None` → no tokenizer.
+    /// (a local path — the Python launcher resolves repo ids). `None` → no tokenizer.
     /// Mirrors the Python `server_args.tokenizer_path or server_args.model_path`.
     pub fn tokenizer_path(&self) -> Option<String> {
         self.str_field("tokenizer_path")
             .filter(|s| !s.is_empty())
             .or_else(|| self.str_field("model_path"))
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
-    /// HF `revision`, used only when `tokenizer_path` is a repo id. `None` → main.
-    pub fn revision(&self) -> Option<String> {
-        self.str_field("revision")
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     }
@@ -328,11 +318,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // The same instance is shared by the tokenizer pool (encode) and the detok
     // shards (decode); `None` only under `skip_tokenizer_init`.
-    let dyn_tokenizer = tokenizer::load_tokenizer(
-        cfg.tokenizer_path.as_deref(),
-        cfg.revision.as_deref(),
-        skip_tokenizer_init,
-    )?;
+    let dyn_tokenizer =
+        tokenizer::load_tokenizer(cfg.tokenizer_path.as_deref(), skip_tokenizer_init)?;
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
