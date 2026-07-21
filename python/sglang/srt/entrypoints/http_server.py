@@ -2147,8 +2147,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": "data:image/png;base64,"
-                                f"{MINIMUM_PNG_PICTURE_BASE64}"
+                                "url": f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"
                             },
                         },
                         {
