@@ -497,7 +497,7 @@ install_extra_deps() {
     # MOONCAKE_STALE_PKG is left as computed above (the *other* variant) so the
     # force-reinstall/uninstall dance below stays correct. Revert this whole
     # block before merging.
-    MOONCAKE_WHEEL_RUN_ID="${MOONCAKE_WHEEL_RUN_ID:-28088854345}"
+    MOONCAKE_WHEEL_RUN_ID="${MOONCAKE_WHEEL_RUN_ID:-8499866108}"
     MOONCAKE_WHEEL_BASE_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/${MOONCAKE_WHEEL_RUN_ID}"
     MOONCAKE_WHEEL_ARTIFACT=""
     case "$(uname -m)" in
