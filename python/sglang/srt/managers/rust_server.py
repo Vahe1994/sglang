@@ -137,6 +137,11 @@ class RustServer:
                 obj.input_ids = ids
                 pos += nbytes
             out.append(obj)
+        logger.debug(
+            "Kan ==== stage=sched_recv n=%d rids=%s",
+            len(out),
+            [getattr(o, "rid", None) for o in out[:8]],
+        )
         return out
 
     def push_control_output(self, recv_req, output) -> None:
@@ -164,6 +169,7 @@ class RustServer:
         # Every control request is a BaseReq, so `rid` always exists; only its
         # value may be None (unrouted control paths) — then fall back to "0".
         rid = recv_req.rid or "0"
+        logger.debug("Kan ==== stage=sched_push_control rid=%s", rid)
         self.server.push_result(rid, encoded)
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
@@ -287,6 +293,12 @@ class RustServer:
                 data_cols += extra.data_cols()
 
         header = msgspec.msgpack.encode(header_cols)
+        logger.debug(
+            "Kan ==== stage=sched_push_gen n=%d finished=%d rids=%s",
+            len(rids),
+            sum(1 for fr in finish_reasons if fr is not None),
+            rids[:8],
+        )
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.
         if not self.server.push_batch(header, data_cols):

@@ -69,12 +69,19 @@ impl Runnable for Egress {
                     for b in buckets.iter_mut() {
                         b.clear();
                     }
+                    let mut n = 0usize;
+                    let mut finished = 0usize;
                     let ok = for_each_chunk(body, |ev| {
+                        n += 1;
+                        if ev.finish_reason.is_some() {
+                            finished += 1;
+                        }
                         buckets[RidHash(ev.rid_hash).shard(shards)].push(ev);
                     });
                     if !ok {
                         tracing::warn!("egress: bad batch frame");
                     }
+                    tracing::debug!("Kan ==== stage=egress_batch n={n} finished={finished}");
                     for (i, b) in buckets.iter_mut().enumerate() {
                         if b.is_empty() {
                             continue;
@@ -88,12 +95,14 @@ impl Runnable for Egress {
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 EGRESS_TAG_RESULT => {
-                    if let Some((rid, msg)) = decode_result(body) {
+                    if let Some((rid, rid_str, msg)) = decode_result(body) {
+                        tracing::debug!("Kan ==== stage=egress_result rid={rid_str}");
                         self.route(rid, msg);
                     }
                 }
                 EGRESS_TAG_ERROR => {
-                    if let Some((rid, msg)) = decode_error(body) {
+                    if let Some((rid, rid_str, msg)) = decode_error(body) {
+                        tracing::debug!("Kan ==== stage=egress_error rid={rid_str}");
                         self.route(rid, msg);
                     }
                 }
@@ -115,13 +124,14 @@ impl Egress {
 }
 
 /// Control result: `[rid, payload]` → single non-streamed delivery to the sink.
-fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+fn decode_result(body: &[u8]) -> Option<(RidHash, String, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    let rid_str = items.next()?.as_str()?.to_owned();
+    let rid = RidHash::from_rid(&rid_str);
     // The decode already owns the payload buffer — move it out.
     let payload = match items.next()? {
         rmpv::Value::Binary(b) => Bytes::from(b),
@@ -130,6 +140,7 @@ fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
     };
     Some((
         rid,
+        rid_str,
         DetokMsg::Result {
             rid_hash: rid,
             payload,
@@ -138,19 +149,21 @@ fn decode_result(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
 }
 
 /// Per-request failure: `[rid, message]` → terminal `Error` to the sink (→ 400).
-fn decode_error(body: &[u8]) -> Option<(RidHash, DetokMsg)> {
+fn decode_error(body: &[u8]) -> Option<(RidHash, String, DetokMsg)> {
     let val = rmpv::decode::read_value(&mut &body[..]).ok()?;
     let rmpv::Value::Array(arr) = val else {
         return None;
     };
     let mut items = arr.into_iter();
-    let rid = RidHash::from_rid(items.next()?.as_str()?);
+    let rid_str = items.next()?.as_str()?.to_owned();
+    let rid = RidHash::from_rid(&rid_str);
     let message = match items.next()? {
         rmpv::Value::String(s) => s.into_str()?,
         _ => return None,
     };
     Some((
         rid,
+        rid_str,
         DetokMsg::Fail {
             rid_hash: rid,
             message,
@@ -170,9 +183,10 @@ mod tests {
     fn error_frame_roundtrips_to_fail() {
         let framed = frame_egress_error("42", "invalid request: bad field");
         assert_eq!(framed[0], EGRESS_TAG_ERROR);
-        let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
+        let (rid, rid_str, msg) = decode_error(&framed[1..]).expect("decodes");
         let want = RidHash::from_rid("42");
         assert_eq!(rid, want);
+        assert_eq!(rid_str, "42");
         match msg {
             DetokMsg::Fail {
                 rid_hash: id,

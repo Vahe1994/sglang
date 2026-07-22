@@ -172,6 +172,10 @@ impl Runnable for DetokenizerWorker {
                     decode_logprob_text,
                     no_stop_trim,
                 } => {
+                    tracing::debug!(
+                        "Kan ==== stage=detok_register rid={rid} shard={}",
+                        self.shard
+                    );
                     table.insert(
                         rid_hash,
                         DetokState {
@@ -207,6 +211,7 @@ impl Runnable for DetokenizerWorker {
 /// single `Done` frame — no detokenization, no streaming.
 fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(&id) {
+        tracing::debug!("Kan ==== stage=detok_done rid={}", st.rid);
         let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
@@ -218,6 +223,7 @@ fn handle_result(table: &mut HashMap<RidHash, DetokState>, id: RidHash, payload:
 /// (the api-server turns it into an HTTP 400) and drop the request.
 fn handle_fail(table: &mut HashMap<RidHash, DetokState>, id: RidHash, message: String) {
     if let Some(mut st) = table.remove(&id) {
+        tracing::debug!("Kan ==== stage=detok_fail rid={}", st.rid);
         let _ = st
             .sink
             .try_send(EgressItem::Error(Error::Validation(message)));
@@ -243,6 +249,7 @@ fn handle_chunk(
     // Queued → Streaming on the first chunk (the scheduler picked it).
     if matches!(st.fsm, RequestState::Queued) {
         let _ = st.fsm.apply(Event::SchedulerPicked);
+        tracing::debug!("Kan ==== stage=detok_first_chunk rid={}", st.rid);
     }
 
     let finished = ev.finish_reason.is_some();
@@ -304,6 +311,7 @@ fn handle_chunk(
     ev.completion_tokens = n_tok;
 
     if finished {
+        tracing::debug!("Kan ==== stage=detok_done rid={}", st.rid);
         // The Done frame *is* the final frame: Finalizing → Completed.
         let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {

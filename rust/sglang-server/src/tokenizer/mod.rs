@@ -136,6 +136,15 @@ impl Runnable for TokenizerWorker {
                 }
             };
             let _ = req.state.apply(event);
+            if let RequestKind::Generate(g) = &req.kind
+                && let Some(ids) = &g.input_ids
+            {
+                tracing::debug!(
+                    "Kan ==== stage=tokenize_done rid={} n_tokens={}",
+                    req.rid,
+                    ids.len()
+                );
+            }
             if self.tm.send(TmEvent::Tokenized(req)).is_err() {
                 tracing::error!("tm inbox closed; dropping request");
                 break;

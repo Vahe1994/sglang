@@ -169,6 +169,10 @@ async fn submit(
     // Health probes get the Python server's `HEALTH_CHECK_<uuid>` rid form so
     // scheduler logs and prefix-gated handling recognize them; a client-supplied
     // rid (already fanned out per item by `split`) wins over minting.
+    let kind_label = match &kind {
+        RequestKind::Generate(_) => "generate",
+        RequestKind::Control(_) => "control",
+    };
     let rid = match &kind {
         RequestKind::Generate(g) if g.is_health_check => crate::ids::new_health_check_rid(),
         RequestKind::Generate(g) => g.rid.clone().unwrap_or_else(crate::ids::new_rid),
@@ -186,7 +190,10 @@ async fn submit(
         kind,
     };
     match state.senders.tm.send_async(TmEvent::Ingress(req)).await {
-        Ok(()) => Ok((id, rid, rx)),
+        Ok(()) => {
+            tracing::debug!("Kan ==== stage=http_submit rid={rid} kind={kind_label}");
+            Ok((id, rid, rx))
+        }
         Err(_) => {
             tracing::error!("tm inbox closed; request dropped");
             Err(())
@@ -885,16 +892,18 @@ async fn drain_unary(
                 if let Some((code, message)) = abort_status(&final_out.finish_reason) {
                     let status =
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    tracing::debug!(
+                        "Kan ==== stage=http_complete rid={rid_str} status={}",
+                        status.as_u16()
+                    );
                     return (status, error_value(code, &message), true);
                 }
-                return (
-                    StatusCode::OK,
-                    sglang_frame_value(&final_out, rid_str),
-                    true,
-                );
+                tracing::debug!("Kan ==== stage=http_complete rid={rid_str} status=200");
+                return (StatusCode::OK, sglang_frame_value(&final_out, rid_str), true);
             }
             EgressItem::Error(e) => {
                 let code = e.http_status();
+                tracing::debug!("Kan ==== stage=http_complete rid={rid_str} status={code}");
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, error_value(code, &e.to_string()), true);
@@ -904,6 +913,7 @@ async fn drain_unary(
     }
     // Sender dropped without a terminal item: the shard dropped this request (a
     // truncation — a client disconnect would have dropped the handler future).
+    tracing::debug!("Kan ==== stage=http_complete rid={rid_str} status=500");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         error_value(500, "response truncated before completion"),
@@ -1007,6 +1017,10 @@ fn generation_event_stream(
             if items.is_empty() {
                 // Channel closed with no terminal → truncation for this item;
                 // leave its rid armed so the scheduler work is aborted.
+                tracing::debug!(
+                    "Kan ==== stage=http_complete rid={} status=500",
+                    rid_strs[i]
+                );
                 yield tag_value(error_value(500, "response truncated before completion"), idx(i));
                 continue;
             }
@@ -1037,12 +1051,23 @@ fn generation_event_stream(
             }
 
             if let Some(e) = failed {
+                tracing::debug!(
+                    "Kan ==== stage=http_complete rid={} status={}",
+                    rid_strs[i],
+                    e.http_status()
+                );
                 yield tag_value(error_value(e.http_status(), &e.to_string()), idx(i));
                 guard.disarm(rids[i]);
             } else if let Some(out) = terminal {
                 // A validation abort → an error object, not a frame. The final frame
                 // carries the full cumulative state, so any coalesced ones are moot.
-                yield match abort_status(&out.finish_reason) {
+                let aborted = abort_status(&out.finish_reason);
+                tracing::debug!(
+                    "Kan ==== stage=http_complete rid={} status={}",
+                    rid_strs[i],
+                    aborted.as_ref().map(|(c, _)| *c).unwrap_or(200)
+                );
+                yield match aborted {
                     Some((code, message)) => tag_value(error_value(code, &message), idx(i)),
                     None => stream_frame_string(out, &accs[i], incremental, &rid_strs[i], idx(i)),
                 };
