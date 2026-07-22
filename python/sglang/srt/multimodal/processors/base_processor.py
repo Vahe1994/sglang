@@ -2,9 +2,11 @@ import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
+import logging
 import multiprocessing as mp
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -820,7 +822,7 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
-
+        t0 = time.perf_counter()
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
@@ -828,67 +830,86 @@ class BaseMultimodalProcessor(ABC):
             image_data, video_data, audio_data
         ):
             # fast path for preprocessed data: early return
-            return BaseMultiModalProcessorOutput(
+            output = BaseMultiModalProcessorOutput(
                 input_text="",
                 input_ids=input_ids,
                 images=list(image_data or []),
                 videos=list(video_data or []),
                 audios=list(audio_data or []),
             )
-
-        multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
-        if isinstance(prompt, list) and return_text:
-            assert len(prompt) and isinstance(prompt[0], int)
-            prompt = self._tokenizer.decode(prompt)
         else:
-            prompt = prompt
+            multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
+            if isinstance(prompt, list) and return_text:
+                assert len(prompt) and isinstance(prompt[0], int)
+                prompt = self._tokenizer.decode(prompt)
+            else:
+                prompt = prompt
 
-        assert isinstance(prompt, str)
-        # split text into list of normal text and special tokens
-        text_parts = re.split(multimodal_tokens_pattern, prompt)
+            assert isinstance(prompt, str)
+            # split text into list of normal text and special tokens
+            text_parts = re.split(multimodal_tokens_pattern, prompt)
 
-        cnt = {Modality.IMAGE: 0, Modality.VIDEO: 0, Modality.AUDIO: 0}
-        for text_part in text_parts:
-            modality = multimodal_tokens.get_modality_of_token(text_part)
-            if modality is not None:
-                cnt[modality] += 1
+            cnt = {Modality.IMAGE: 0, Modality.VIDEO: 0, Modality.AUDIO: 0}
+            for text_part in text_parts:
+                modality = multimodal_tokens.get_modality_of_token(text_part)
+                if modality is not None:
+                    cnt[modality] += 1
 
-        n_image = len(image_data) if image_data else 0
-        n_video = len(video_data) if video_data else 0
-        n_audio = len(audio_data) if audio_data else 0
+            n_image = len(image_data) if image_data else 0
+            n_video = len(video_data) if video_data else 0
+            n_audio = len(audio_data) if audio_data else 0
 
-        # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
-        if (
-            self.skip_tokenizer_init
-            or cnt[Modality.IMAGE] != n_image
-            or cnt[Modality.VIDEO] != n_video
-            or cnt[Modality.AUDIO] != n_audio
-            or getattr(self, "support_dynamic_frame_expansion", False)
-        ):
-            return await self.legacy_load_mm_data(
-                prompt=prompt,
-                multimodal_tokens=multimodal_tokens,
-                image_data=image_data,
-                video_data=video_data,
-                audio_data=audio_data,
-                return_text=return_text,
-                discard_alpha_channel=discard_alpha_channel,
-                audio_sample_rate=audio_sample_rate,
-                input_ids=input_ids,
+            # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
+            if (
+                self.skip_tokenizer_init
+                or cnt[Modality.IMAGE] != n_image
+                or cnt[Modality.VIDEO] != n_video
+                or cnt[Modality.AUDIO] != n_audio
+                or getattr(self, "support_dynamic_frame_expansion", False)
+            ):
+                output = await self.legacy_load_mm_data(
+                    prompt=prompt,
+                    multimodal_tokens=multimodal_tokens,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    return_text=return_text,
+                    discard_alpha_channel=discard_alpha_channel,
+                    audio_sample_rate=audio_sample_rate,
+                    input_ids=input_ids,
+                )
+            else:
+                # For models other than MiniCPMO and MiniCPMV,
+                # totally align multimodal_tokens, fast path
+                output = await self.fast_load_mm_data(
+                    prompt=prompt,
+                    multimodal_tokens=multimodal_tokens,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    return_text=return_text,
+                    discard_alpha_channel=discard_alpha_channel,
+                    audio_sample_rate=audio_sample_rate,
+                    input_ids=input_ids,
+                )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            image_sizes = []
+            for img in output.images or []:
+                if isinstance(img, Image.Image):
+                    image_sizes.append((img.height, img.width))
+                elif hasattr(img, "height") and hasattr(img, "width"):
+                    try:
+                        image_sizes.append((int(img.height), int(img.width)))
+                    except (TypeError, ValueError):
+                        pass
+            logger.debug(
+                "[MM preprocess] load: n_images=%d image_sizes=%s load_ms=%.2f",
+                len(output.images or []),
+                image_sizes,
+                (time.perf_counter() - t0) * 1000,
             )
-        # For models other than MiniCPMO and MiniCPMV,
-        # totally align multimodal_tokens, fast path
-        return await self.fast_load_mm_data(
-            prompt=prompt,
-            multimodal_tokens=multimodal_tokens,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            return_text=return_text,
-            discard_alpha_channel=discard_alpha_channel,
-            audio_sample_rate=audio_sample_rate,
-            input_ids=input_ids,
-        )
+        return output
 
     async def fast_load_mm_data(
         self,
@@ -1358,6 +1379,7 @@ class BaseMultimodalProcessor(ABC):
         input_ids = None
         # Handle raw items (need processing)
         if raw_images or raw_audios or raw_videos:
+            t0 = time.perf_counter()
             collected_items, input_ids, ret = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
@@ -1366,6 +1388,20 @@ class BaseMultimodalProcessor(ABC):
                 **kwargs,
             )
             all_collected_items = collected_items
+            if logger.isEnabledFor(logging.DEBUG):
+                feature_shapes = [
+                    tuple(item.feature.shape)
+                    for item in collected_items
+                    if item.is_image()
+                    and item.feature is not None
+                    and hasattr(item.feature, "shape")
+                ]
+                logger.debug(
+                    "[MM preprocess] process: n_raw_images=%d feature_shapes=%s process_ms=%.2f",
+                    len(raw_images),
+                    feature_shapes,
+                    (time.perf_counter() - t0) * 1000,
+                )
 
             # When SGLANG_MM_AVOID_RETOKENIZE is on, keep the user's exact tokens to avoid retokenize drift.
             # Drift happens when Retokenization is not identity: Decode(X) => String => Re-tokenize => Y, X != Y.
@@ -1403,6 +1439,12 @@ class BaseMultimodalProcessor(ABC):
                             image_placeholder_token_id,
                         ),
                         dtype=input_ids.dtype,
+                    )
+                    logger.debug(
+                        "[MM preprocess] expand: counts=%s %d -> %d",
+                        counts,
+                        len(base_output.input_ids),
+                        input_ids.numel(),
                     )
                 except Exception as e:
                     logger.warning(
