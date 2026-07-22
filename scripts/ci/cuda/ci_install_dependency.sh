@@ -484,31 +484,38 @@ install_extra_deps() {
     fi
 
     # >>> TEMP — DO NOT MERGE: validate custom Mooncake wheels -----------------
-    # Pull a custom Mooncake wheel from the kvcache-ai/Mooncake CI run
-    # 28088854345 (auth-free permalinks via nightly.link) and install it on the
-    # matching runner, so the disaggregation tests exercise this build instead
-    # of the pinned PyPI package. Selected per (arch, CUDA major) so the wheel's
-    # package name matches whatever MOONCAKE_PKG/MOONCAKE_STALE_PKG were set to
-    # above:
+    # Pull a custom Mooncake wheel from a kvcache-ai/Mooncake CI run (auth-free
+    # permalinks via nightly.link) and install it on the matching runner, so the
+    # disaggregation tests exercise this build instead of the pinned PyPI
+    # package. Bump MOONCAKE_WHEEL_RUN_ID (or export it in the CI env) to point
+    # at a fresh Mooncake build — it's the only value that changes per iteration.
+    # The artifact is selected per (arch, CUDA major) so the wheel's package name
+    # matches whatever MOONCAKE_PKG/MOONCAKE_STALE_PKG were set to above:
     #   - aarch64      -> wheel-arm64-py312                 (mooncake-transfer-engine; GB300 is CU12)
     #   - x86_64, CU12 -> mooncake-wheel-ubuntu-py312       (mooncake-transfer-engine)
     #   - x86_64, CU13 -> mooncake-wheel-cu130-ubuntu-py312 (mooncake-transfer-engine-cuda13)
     # MOONCAKE_STALE_PKG is left as computed above (the *other* variant) so the
     # force-reinstall/uninstall dance below stays correct. Revert this whole
     # block before merging.
-    MOONCAKE_WHEEL_ZIP_URL=""
+    MOONCAKE_WHEEL_RUN_ID="${MOONCAKE_WHEEL_RUN_ID:-28088854345}"
+    MOONCAKE_WHEEL_BASE_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/${MOONCAKE_WHEEL_RUN_ID}"
+    MOONCAKE_WHEEL_ARTIFACT=""
     case "$(uname -m)" in
         aarch64)
-            MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/wheel-arm64-py312.zip"
+            MOONCAKE_WHEEL_ARTIFACT="wheel-arm64-py312"
             ;;
         x86_64)
             if [ "$CU_MAJOR" = "13" ]; then
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-cu130-ubuntu-py312.zip"
+                MOONCAKE_WHEEL_ARTIFACT="mooncake-wheel-cu130-ubuntu-py312"
             else
-                MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/runs/28088854345/mooncake-wheel-ubuntu-py312.zip"
+                MOONCAKE_WHEEL_ARTIFACT="mooncake-wheel-ubuntu-py312"
             fi
             ;;
     esac
+    MOONCAKE_WHEEL_ZIP_URL=""
+    if [ -n "$MOONCAKE_WHEEL_ARTIFACT" ]; then
+        MOONCAKE_WHEEL_ZIP_URL="${MOONCAKE_WHEEL_BASE_URL}/${MOONCAKE_WHEEL_ARTIFACT}.zip"
+    fi
     if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
         MOONCAKE_WHEEL_DIR="$(mktemp -d)"
         curl -fSL --retry 3 --retry-delay 2 \
