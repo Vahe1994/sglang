@@ -27,10 +27,7 @@ from sglang.QuantKernel.oscar_rotation_clip_int2_kv import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv_quant_kernels import (
-    _get_num_scale_groups,
-    quantized_set_kv_int2_triton,
-)
+from sglang.srt.mem_cache.kv_quant_kernels import _get_num_scale_groups
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     OscarRotationConfig,
@@ -39,11 +36,6 @@ from sglang.srt.mem_cache.memory_pool import (
     load_oscar_rotation_config,
     load_oscar_rotations,
     unwrap_write_loc,
-)
-from sglang.srt.mem_cache.wush_transforms import (
-    WushRuntimeTransforms,
-    apply_wush_kv_transform,
-    load_wush_runtime_transforms,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,7 +141,6 @@ class UnifiedInt2HPKVPool(KVCache):
         hp_recent_tokens: int,
         dtype: str,
         head_num: int,
-        total_num_kv_heads: int,
         head_dim: int,
         layer_num: int,
         device: str,
@@ -184,7 +175,6 @@ class UnifiedInt2HPKVPool(KVCache):
         self.hp_dtype = hp_dtype
         self.scale_dtype = scale_dtype
         self.head_num = head_num
-        self.total_num_kv_heads = total_num_kv_heads
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
         self.hp_prefix_tokens = int(hp_prefix_tokens)
@@ -251,108 +241,39 @@ class UnifiedInt2HPKVPool(KVCache):
         # Cached attributes used by the rest of the stack.
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = None
-        self.row_dim = self.head_num * self.head_dim  # K flattened row width
-        self.v_row_dim = self.head_num * self.v_head_dim  # V flattened row width
+        self.row_dim = self.head_num * self.head_dim  # for store_cache helpers
+        self.same_kv_dim = self.head_dim == self.v_head_dim
 
-        self.transform_mode = envs.SGLANG_INT2_TRANSFORM.get().strip().lower()
-        if self.transform_mode not in ("oscar", "wush"):
-            raise ValueError(
-                "SGLANG_INT2_TRANSFORM must be one of {'oscar', 'wush'}, got "
-                f"{self.transform_mode!r}"
-            )
-
-        self._oscar_cfg: Optional[OscarRotationConfig] = None
-        self._R_k: Optional[torch.Tensor] = None
-        self._R_v: Optional[torch.Tensor] = None
-        self._wush: Optional[WushRuntimeTransforms] = None
-        self._k_clip_ratio = 0.0
-        self._v_clip_ratio = 0.0
-        self._lloyd_max = False
-
-        if self.transform_mode == "wush":
-            if self.head_dim != self.v_head_dim:
-                raise ValueError(
-                    "WUSH transform mode currently requires equal K/V head "
-                    f"dimensions, got K={self.head_dim}, V={self.v_head_dim}"
-                )
-            if self.k_num_scale_groups != 1 or self.v_num_scale_groups != 1:
-                raise ValueError(
-                    "WUSH transform mode currently requires one affine INT2 "
-                    "scale per token/head; "
-                    "omit --kv-cache-quant-group-size or set it to both K/V "
-                    "head dimensions"
-                )
-            self._k_clip_ratio = envs.SGLANG_WUSH_K_CLIP_RATIO.get()
-            self._v_clip_ratio = envs.SGLANG_WUSH_V_CLIP_RATIO.get()
-            for name, ratio in (
-                ("K", self._k_clip_ratio),
-                ("V", self._v_clip_ratio),
-            ):
-                if not 0.0 <= ratio <= 1.0:
-                    raise ValueError(
-                        f"SGLANG_WUSH_{name}_CLIP_RATIO must be in [0, 1], "
-                        f"got {ratio}"
-                    )
-            if (
-                self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0
-            ) and self.hp_dtype != torch.bfloat16:
-                raise ValueError(
-                    "WUSH percentile clipping currently requires "
-                    "SGLANG_MIXED_KV_HP_DTYPE=bfloat16"
-                )
-            compute_dtype = _resolve_torch_dtype(
-                envs.SGLANG_WUSH_COMPUTE_DTYPE.get(), kind="WUSH compute"
-            )
-            self._wush = load_wush_runtime_transforms(
-                envs.SGLANG_WUSH_TRANSFORM_PATH.get(),
-                start_layer=self.start_layer,
-                layer_num=self.layer_num,
-                total_num_kv_heads=self.total_num_kv_heads,
-                local_num_kv_heads=self.head_num,
-                k_head_dim=self.head_dim,
-                v_head_dim=self.v_head_dim,
-                device=torch.device(self.device),
-                dtype=compute_dtype,
-            )
-            logger.info(
-                "UnifiedInt2HPKVPool: WUSH transform enabled "
-                "with the existing affine INT2 quantizer "
-                "(path=%s compute_dtype=%s k_clip=%.4f v_clip=%.4f)",
-                envs.SGLANG_WUSH_TRANSFORM_PATH.get(),
-                compute_dtype,
-                self._k_clip_ratio,
-                self._v_clip_ratio,
-            )
-        else:
-            # Oscar rotation + clip. Per-layer orthogonal matrices are shared
-            # across heads and loaded in hp_dtype for the online GEMMs.
-            self._oscar_cfg = load_oscar_rotation_config()
-            self._k_clip_ratio = self._oscar_cfg.k_clip_ratio
-            self._v_clip_ratio = self._oscar_cfg.v_clip_ratio
-            self._lloyd_max = envs.SGLANG_LLOYD_MAX.get()
-            self._R_k = load_oscar_rotations(
-                self._oscar_cfg.k_rotation_path,
-                layer_num=self.layer_num,
-                start_layer=self.start_layer,
-                head_dim=self.head_dim,
-                device=torch.device(self.device),
-                dtype=self.hp_dtype,
-            )
-            self._R_v = load_oscar_rotations(
-                self._oscar_cfg.v_rotation_path,
-                layer_num=self.layer_num,
-                start_layer=self.start_layer,
-                head_dim=self.v_head_dim,
-                device=torch.device(self.device),
-                dtype=self.hp_dtype,
-            )
-            logger.info(
-                "UnifiedInt2HPKVPool: Oscar rotation enabled "
-                "(k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
-                self._k_clip_ratio,
-                self._v_clip_ratio,
-                self._lloyd_max,
-            )
+        # Oscar rotation + clip. Per-layer orthogonal matrices [head_dim,
+        # head_dim] / [v_head_dim, v_head_dim] are loaded in ``hp_dtype`` so
+        # the ``rows @ R`` pre-pass and ``result @ R.T`` inverse are plain
+        # bf16 GEMMs.
+        self._oscar_cfg: OscarRotationConfig = load_oscar_rotation_config()
+        self._k_clip_ratio: float = self._oscar_cfg.k_clip_ratio
+        self._v_clip_ratio: float = self._oscar_cfg.v_clip_ratio
+        self._lloyd_max: bool = envs.SGLANG_LLOYD_MAX.get()
+        self._R_k: torch.Tensor = load_oscar_rotations(
+            self._oscar_cfg.k_rotation_path,
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=self.head_dim,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+        )
+        self._R_v: torch.Tensor = load_oscar_rotations(
+            self._oscar_cfg.v_rotation_path,
+            layer_num=self.layer_num,
+            start_layer=self.start_layer,
+            head_dim=self.v_head_dim,
+            device=torch.device(self.device),
+            dtype=self.hp_dtype,
+        )
+        logger.info(
+            "UnifiedInt2HPKVPool: Oscar rotation enabled (k_clip=%.4f v_clip=%.4f lloyd_max=%s)",
+            self._k_clip_ratio,
+            self._v_clip_ratio,
+            self._lloyd_max,
+        )
 
         hp_total_slots = (
             self.num_hp_prefix_slots + self.max_req_slots * self.hp_recent_ring_size
@@ -660,24 +581,13 @@ class UnifiedInt2HPKVPool(KVCache):
         cache_v: torch.Tensor,
         v_rotation_absorbed: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Move K/V into the active transform's cache coordinates.
+        """Apply the per-layer Oscar rotation ``rows @ R`` to HP K/V tiles.
 
-        WUSH uses blockwise per-KV-head right matrices; Oscar uses its shared
-        per-layer orthogonal matrices. Returns ``hp_dtype`` tensors ready to
-        be stored or packed.
+        Returns tensors in ``self.hp_dtype`` ready to be stored or packed.
+        ``R_k`` / ``R_v`` are ``[head_dim, head_dim]`` bf16 on the KV device,
+        loaded in ``__init__``.
         """
         idx = self._layer_index(layer_id)
-        if self._wush is not None:
-            return (
-                apply_wush_kv_transform(
-                    cache_k, self._wush.k_right[idx], output_dtype=self.hp_dtype
-                ),
-                apply_wush_kv_transform(
-                    cache_v, self._wush.v_right[idx], output_dtype=self.hp_dtype
-                ),
-            )
-
-        assert self._R_k is not None and self._R_v is not None
         k_hp = cache_k.to(self.hp_dtype) @ self._R_k[idx]
         if v_rotation_absorbed:
             v_hp = cache_v.to(self.hp_dtype)
@@ -693,7 +603,7 @@ class UnifiedInt2HPKVPool(KVCache):
         already_rotated: bool,
         v_rotation_absorbed: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply the active K/V transform and cast to ``hp_dtype``.
+        """Apply the Oscar rotation to HP K/V and cast to ``hp_dtype``.
         ``already_rotated`` skips the rotation pre-pass.
         """
         if already_rotated:
@@ -719,7 +629,7 @@ class UnifiedInt2HPKVPool(KVCache):
             device_module=self.device_module,
             size_limit=self.hp_k_buffer[idx].shape[0],
             alt_stream=self.alt_stream,
-            v_row_dim=self.v_row_dim,
+            same_kv_dim=self.same_kv_dim,
         )
 
     def _set_quant_kv_buffer_extend(
@@ -732,53 +642,13 @@ class UnifiedInt2HPKVPool(KVCache):
         mixed_hp_offset: Optional[int] = None,
         v_rotation_absorbed: bool = False,
     ):
-        """Prefill/extend-only: transform + INT2-pack + write quant slots.
-
-        Oscar may additionally clip or use its fused rotate/quantize kernel;
-        WUSH transform mode reuses the existing affine INT2 quantizer and can
-        optionally apply the same percentile-clipping kernel in WUSH space.
+        """Prefill/extend-only: rotate (oscar R) + optional per-row clip +
+        int2-pack + write quant slots.
 
         Decode-time flushes go through the dedicated GPU flush kernel
         (see ``gpu_flush_int2``); this method is *not* used for those.
         """
         idx = self._layer_index(layer_id)
-        if self._wush is not None:
-            # print("We are using wush ")
-            if not already_hadamard_transformed:
-                cache_k, cache_v = self._rotate_kv_inplace(layer_id, cache_k, cache_v)
-            else:
-                cache_k = cache_k.to(self.hp_dtype)
-                cache_v = cache_v.to(self.hp_dtype)
-            if self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0:
-                quantized_set_kv_int2_pretransformed_clip_triton(
-                    cache_k,
-                    cache_v,
-                    quant_loc,
-                    self.k_buffer[idx],
-                    self.v_buffer[idx],
-                    self.k_scales_zeros[idx],
-                    self.v_scales_zeros[idx],
-                    self._k_clip_ratio,
-                    self._v_clip_ratio,
-                    hp_global_offset=mixed_hp_offset,
-                    lloyd_max=False,
-                )
-            else:
-                # print("we are quantizing?")
-                # print(cache_k.shape)
-                # print(cache_k.dtype)
-                quantized_set_kv_int2_triton(
-                    cache_k,
-                    cache_v,
-                    quant_loc,
-                    self.k_buffer[idx],
-                    self.v_buffer[idx],
-                    self.k_scales_zeros[idx],
-                    self.v_scales_zeros[idx],
-                    hp_global_offset=mixed_hp_offset,
-                )
-            return
-
         clip_on = self._k_clip_ratio > 0.0 or self._v_clip_ratio > 0.0
 
         # Fused rotate(K) + clip(KV) + quantize(KV) + set(KV). Skips the
