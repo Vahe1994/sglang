@@ -8543,6 +8543,23 @@ class ServerArgs:
         # combinations up front so we fail at startup with a clear message
         # rather than a cryptic TypeError mid-forward.
         if self.kv_cache_dtype == "int2":
+            transform_mode = envs.SGLANG_INT2_TRANSFORM.get().strip().lower()
+            if transform_mode not in ("oscar", "wush"):
+                raise ValueError(
+                    "SGLANG_INT2_TRANSFORM must be one of {'oscar', 'wush'}, "
+                    f"got {transform_mode!r}"
+                )
+            if transform_mode == "wush":
+                if not envs.SGLANG_ENABLE_MIXED_KV_WINDOWS.get():
+                    raise ValueError(
+                        "SGLANG_INT2_TRANSFORM=wush requires "
+                        "SGLANG_ENABLE_MIXED_KV_WINDOWS=1"
+                    )
+                if not envs.SGLANG_WUSH_TRANSFORM_PATH.get():
+                    raise ValueError(
+                        "SGLANG_INT2_TRANSFORM=wush requires "
+                        "SGLANG_WUSH_TRANSFORM_PATH"
+                    )
             bad_backend = None
             if (
                 self.attention_backend not in (None, "triton")
@@ -8563,6 +8580,12 @@ class ServerArgs:
                     f"Got {bad_backend}. Use either `--attention-backend "
                     "triton` or `--prefill-attention-backend fa3 "
                     "--decode-attention-backend triton`."
+                )
+            if transform_mode == "wush" and not self._unified_mixed_kv_active():
+                raise ValueError(
+                    "SGLANG_INT2_TRANSFORM=wush requires the unified mixed-KV "
+                    "path (Triton decode, Triton or FA3 prefill, no speculative "
+                    "decoding, no disaggregation, and no hybrid-SWA model)."
                 )
 
         # Check pdmux

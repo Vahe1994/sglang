@@ -1433,6 +1433,7 @@ class KVCacheConfigurator:
             hp_recent_tokens=envs.SGLANG_MIXED_KV_RECENT_TOKENS.get(),
             dtype=self.server_args.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
             layer_num=self.layer_info.num_effective_layers,

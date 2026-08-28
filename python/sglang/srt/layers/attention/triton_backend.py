@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
@@ -26,6 +26,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.quantized_kv_prefill import (
     _apply_oscar_rotation,
     _pool_uses_oscar_rotation,
+    _pool_uses_wush_transform,
     apply_inverse_v_rotation,
     apply_segmented_hadamard_transform,
     dequantize_prefix_kv,
@@ -40,6 +41,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_kv_pool import UnifiedInt2HPKVPool
+from sglang.srt.mem_cache.wush_transforms import apply_wush_gqa_transform
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -2369,6 +2371,7 @@ class TritonAttnBackend(AttentionBackend):
             kv_pool.dtype == "int2"
         ):
             assert self.dcp_size == 1, "int2 KV cache does not support DCP"
+            uses_wush = _pool_uses_wush_transform(kv_pool)
             uses_oscar = _pool_uses_oscar_rotation(kv_pool)
 
             q_for_decode = q.contiguous().view(
@@ -2411,11 +2414,15 @@ class TritonAttnBackend(AttentionBackend):
                     "KVCacheConfigurator int2 pool selection."
                 )
 
-            oscar_layer_idx = layer.layer_id - kv_pool.start_layer
+            transform_layer_idx = layer.layer_id - kv_pool.start_layer
 
-            if uses_oscar:
+            if uses_wush:
+                q_for_decode = apply_wush_gqa_transform(
+                    q_for_decode, kv_pool._wush.q_right[transform_layer_idx]
+                )
+            elif uses_oscar:
                 q_for_decode = _apply_oscar_rotation(
-                    q_for_decode, kv_pool._R_k[oscar_layer_idx]
+                    q_for_decode, kv_pool._R_k[transform_layer_idx]
                 )
             else:
                 q_for_decode = apply_segmented_hadamard_transform(q_for_decode)
@@ -2466,11 +2473,18 @@ class TritonAttnBackend(AttentionBackend):
                     sinks=sinks,
                     xai_temperature_len=layer.xai_temperature_len,
                 )
-            # int2: V is always rotated, so apply the inverse rotation to the
-            # output. Oscar mode uses ``o @ R_v.T``; Hadamard mode re-applies
-            # the segmented FWHT (self-inverse with 1/sqrt(N)).
-            if uses_oscar:
-                R_v = kv_pool._R_v[oscar_layer_idx]
+            # Return the attention output from the cached V coordinate system.
+            # WUSH uses its per-KV-head inverse-transpose, Oscar uses
+            # ``o @ R_v.T``, and Hadamard re-applies the self-inverse FWHT.
+            if uses_wush:
+                o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                o3.copy_(
+                    apply_wush_gqa_transform(
+                        o3, kv_pool._wush.o_right[transform_layer_idx]
+                    )
+                )
+            elif uses_oscar:
+                R_v = kv_pool._R_v[transform_layer_idx]
                 o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                 o3.copy_((o3.to(R_v.dtype) @ R_v.T).to(o3.dtype))
             else:

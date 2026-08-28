@@ -506,9 +506,22 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             return key_len
         return max(0, min(key_len, int(cutoff_len)))
 
-    def _committed_fill_ids(self, req: Req) -> list[int]:
-        committed_len = min(int(req.kv_committed_len), len(req.fill_ids))
-        return req.fill_ids[:committed_len]
+    def _committed_fill_ids(self, req):
+        """Return token ids whose KV entries are actually committed."""
+
+        committed_len = int(req.kv_committed_len)
+
+        # New Req API: full_untruncated_fill_ids replaces the old fill_ids.
+        fill_ids = req.full_untruncated_fill_ids
+
+        # During chunked prefill, do not look beyond the currently admitted
+        # extend range.
+        if req.extend_range is not None:
+            committed_len = min(committed_len, req.extend_range.end)
+
+        committed_len = min(committed_len, len(fill_ids))
+
+        return fill_ids[:committed_len]
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int

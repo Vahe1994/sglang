@@ -41,11 +41,15 @@ from sglang.srt.environ import envs
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
-    from sglang.jit_kernel.hadamard import hadamard_transform
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
 from sglang.srt.mem_cache.kv_quant_kernels import (
     _get_num_scale_groups,
     dequantize_kv_int2_triton,
+)
+from sglang.srt.mem_cache.wush_transforms import (
+    apply_wush_gqa_transform,
+    apply_wush_kv_transform,
 )
 
 if TYPE_CHECKING:
@@ -97,6 +101,10 @@ def _pool_uses_oscar_rotation(kv_pool) -> bool:
     return getattr(kv_pool, "_R_k", None) is not None
 
 
+def _pool_uses_wush_transform(kv_pool) -> bool:
+    return getattr(kv_pool, "_wush", None) is not None
+
+
 def _apply_oscar_rotation(tensor: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
     """Apply ``tensor @ R`` along the last dim. Returns a contiguous tensor in
     ``R.dtype``. Works for shapes ``[*, head_dim]``.
@@ -124,8 +132,18 @@ def prepare_quantized_extend_qkv(
     if kv_dtype != "int2":
         return q, k, v, need_v_inverse
 
+    layer_idx = layer.layer_id - kv_pool.start_layer
+    if _pool_uses_wush_transform(kv_pool):
+        # print("we are indeed using wush transform")
+        if not q_already_hadamard_transformed:
+            q = apply_wush_gqa_transform(q, kv_pool._wush.q_right[layer_idx])
+        if not kv_already_hadamard_transformed:
+            k = apply_wush_kv_transform(k, kv_pool._wush.k_right[layer_idx])
+            v = apply_wush_kv_transform(v, kv_pool._wush.v_right[layer_idx])
+        need_v_inverse = True
+        return q, k, v, need_v_inverse
+
     if _pool_uses_oscar_rotation(kv_pool):
-        layer_idx = layer.layer_id - kv_pool.start_layer
         R_k = kv_pool._R_k[layer_idx]
         R_v = kv_pool._R_v[layer_idx]
         v_rotation_absorbed = bool(getattr(layer, "oscar_v_rotation_absorbed", False))
@@ -303,6 +321,7 @@ def dequantize_prefix_kv(
     Grouped scales (``scales.shape[-1] > 2``) are handled by
     ``dequantize_kv_int2_triton`` internally.
     """
+    # print("we are using prefix kv dequant")
     device = prefix_indices.device
     if prefix_indices.numel() == 0:
         return (
@@ -326,6 +345,8 @@ def dequantize_prefix_kv(
         assert (
             kv_pool.dtype == "int2"
         ), f"Unsupported quantized KV dtype: {kv_pool.dtype}"
+        # print(kv_pool.get_raw_key_buffer(layer_id).shape)
+        # print(kv_pool.hp_global_offset)
         return (
             _mixed_prefix_dequantize_tensor(
                 prefix_indices,
@@ -352,6 +373,9 @@ def dequantize_prefix_kv(
     scales_k = kv_pool.get_key_scales_zeros(layer_id)[prefix_indices]
     scales_v = kv_pool.get_value_scales_zeros(layer_id)[prefix_indices]
     assert kv_pool.dtype == "int2", f"Unsupported quantized KV dtype: {kv_pool.dtype}"
+    # print(kv_pool.dtype)
+    # print(raw_k.shape)
+    # print(scales_k.shape)
     return (
         dequantize_kv_int2_triton(raw_k, scales_k, kv_pool.head_dim, model_dtype),
         dequantize_kv_int2_triton(raw_v, scales_v, kv_pool.v_head_dim, model_dtype),
@@ -373,6 +397,9 @@ def apply_inverse_v_rotation(
     """
     if not need_v_inverse or kv_pool.dtype != "int2":
         return result
+    if _pool_uses_wush_transform(kv_pool):
+        layer_idx = layer.layer_id - kv_pool.start_layer
+        return apply_wush_gqa_transform(result, kv_pool._wush.o_right[layer_idx])
     if _pool_uses_oscar_rotation(kv_pool):
         layer_idx = layer.layer_id - kv_pool.start_layer
         R_v = kv_pool._R_v[layer_idx]

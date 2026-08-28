@@ -915,7 +915,10 @@ def maybe_absorb_oscar_v_rotation_into_qkv(
         load_oscar_rotations,
     )
 
-    if not envs.SGLANG_OSCAR_ABSORB_V_ROTATION.get():
+    if (
+        not envs.SGLANG_OSCAR_ABSORB_V_ROTATION.get()
+        or envs.SGLANG_INT2_TRANSFORM.get().strip().lower() != "oscar"
+    ):
         return False
 
     oscar_cfg = load_oscar_rotation_config()

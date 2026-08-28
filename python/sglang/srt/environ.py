@@ -372,6 +372,16 @@ class Envs:
     SGLANG_OSCAR_K_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_V_CLIP_RATIO = EnvFloat(0.0)
     SGLANG_OSCAR_ABSORB_V_ROTATION = EnvBool(False)
+    # INT2 transform strategy. ``oscar`` preserves the existing orthogonal,
+    # per-layer path; ``wush`` loads non-orthogonal per-KV-head matrices from
+    # a checkpoint produced by scripts/convert_wush_transforms.py.
+    SGLANG_INT2_TRANSFORM = EnvStr("wush")
+    SGLANG_WUSH_TRANSFORM_PATH = EnvStr("")
+    SGLANG_WUSH_COMPUTE_DTYPE = EnvStr("float32")
+    # Optional percentile clipping in WUSH-transformed coordinates. Zero
+    # disables clipping; positive values select sort(abs(row))[ratio * dim].
+    SGLANG_WUSH_K_CLIP_RATIO = EnvFloat(0.0)
+    SGLANG_WUSH_V_CLIP_RATIO = EnvFloat(0.0)
     # Fuse oscar K-rotation (rows @ R_k) into the prefill clip+quantize+pack
     # kernel. Eliminates the separate bf16 GEMM staging and the intermediate
     # rotated-K tensor for the quant pack. Requires oscar mode, V-rotation
