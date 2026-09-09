@@ -32,6 +32,9 @@ Note: AIME answers are always integers from 000 to 999 (inclusive). If you get a
 Remember to put your answer on its own line after "Answer:", and express your answer as an integer from 000 to 999.
 """.strip()
 
+BOXED_ANSWER_PATTERN = r"\\boxed\s*\{\s*([+-]?\d{1,4})\s*\}"
+DIRECT_ANSWER_PATTERN = r"(?i)Answer\s*:\s*(?:\$+\s*)?([+-]?\d{1,4}(?:\.0+)?)"
+
 
 def normalize_aime_answer(answer: str) -> Optional[str]:
     """
@@ -51,6 +54,30 @@ def normalize_aime_answer(answer: str) -> Optional[str]:
     except (ValueError, TypeError):
         pass
     return answer
+
+
+def extract_aime_answer(response_text: str) -> Optional[str]:
+    """Extract the last explicit AIME answer from common model formats.
+
+    Reasoning models commonly emit ``Final Answer:\n$$\boxed{123}$$``. The
+    generic ``Answer: <same-line text>`` regex captures ``$$`` in that case,
+    so collect numeric boxed/direct candidates and choose the last one.
+    """
+    candidates: list[tuple[int, str]] = []
+    candidates.extend(
+        (match.start(), match.group(1))
+        for match in re.finditer(BOXED_ANSWER_PATTERN, response_text)
+    )
+    candidates.extend(
+        (match.start(), match.group(1))
+        for match in re.finditer(DIRECT_ANSWER_PATTERN, response_text)
+    )
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+
+    # Preserve compatibility with unusual non-numeric Answer: payloads.
+    match = re.search(ANSWER_PATTERN, response_text)
+    return match.group(1).strip() if match else None
 
 
 class AIME25Eval(Eval):
@@ -95,8 +122,7 @@ class AIME25Eval(Eval):
             response_text = response_text or ""
 
             # Extract answer from response
-            match = re.search(ANSWER_PATTERN, response_text)
-            extracted_answer = match.group(1).strip() if match else None
+            extracted_answer = extract_aime_answer(response_text)
 
             # Normalize both answers for comparison
             normalized_extracted = normalize_aime_answer(extracted_answer)
